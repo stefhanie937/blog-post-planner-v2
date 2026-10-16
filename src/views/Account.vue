@@ -1,14 +1,18 @@
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter, onBeforeRouteLeave } from 'vue-router'
-import { User, Mail, Lock, Eye, EyeOff, Download, LogOut, LayoutGrid } from 'lucide-vue-next'
+import { User, Mail, Lock, Eye, EyeOff, Download, LogOut, LayoutGrid, Camera, Bell } from 'lucide-vue-next'
 import AppShell from '../layouts/AppShell.vue'
+import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../composables/useAuth'
 import { usePosts } from '../composables/usePosts'
+import { useReminders, LEAD_OPTIONS } from '../composables/useReminders'
 
 const router = useRouter()
 const { user, updateProfile, changePassword, signOut } = useAuth()
 const { posts, loading, fetchPosts } = usePosts()
+const { settings: reminderSettings, permission, supported, enableReminders, disableReminders, setLead, sendTest } =
+  useReminders()
 
 // ---------------------------------------------------------------------------
 // Shared look (matches the rest of the app)
@@ -31,7 +35,7 @@ const noticeClass = {
 // ---------------------------------------------------------------------------
 // Notices (success ones fade away on their own)
 // ---------------------------------------------------------------------------
-const notices = reactive({ profile: null, password: null, export: null })
+const notices = reactive({ profile: null, password: null, export: null, avatar: null, reminders: null })
 const noticeTimers = {}
 
 function setNotice(key, type, text) {
@@ -87,9 +91,128 @@ const initials = computed(() => {
   return letters || email.value.charAt(0).toUpperCase() || '?'
 })
 
-const avatarUrl = computed(() => meta.value.avatar_url || meta.value.picture || '')
+// ---------------------------------------------------------------------------
+// Profile picture (upload / remove)
+// ---------------------------------------------------------------------------
+const AVATAR_BUCKET = 'avatars'
+const AVATAR_SIZE = 400 // px, square
+const AVATAR_MAX_BYTES = 5 * 1024 * 1024
+
+// Shows the new picture right away, before the auth session catches up.
+const avatarOverride = ref(undefined)
+const avatarUrl = computed(() =>
+  avatarOverride.value !== undefined ? avatarOverride.value : meta.value.avatar_url || meta.value.picture || ''
+)
 const avatarFailed = ref(false)
 const showAvatar = computed(() => !!avatarUrl.value && !avatarFailed.value)
+watch(avatarUrl, () => {
+  avatarFailed.value = false
+})
+
+const avatarInput = ref(null)
+const uploadingAvatar = ref(false)
+
+// Returns the storage path if the URL points at our own avatars bucket (not a Google photo).
+function ownedAvatarPath(url) {
+  const marker = `/storage/v1/object/public/${AVATAR_BUCKET}/`
+  const index = url ? url.indexOf(marker) : -1
+  return index === -1 ? null : decodeURIComponent(url.slice(index + marker.length).split('?')[0])
+}
+
+const hasCustomAvatar = computed(() => !!ownedAvatarPath(avatarUrl.value))
+
+// Center-crops to a square and shrinks it, so uploads stay small and fast.
+function resizeToSquare(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    const url = URL.createObjectURL(file)
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+      const side = Math.min(img.width, img.height)
+      const canvas = document.createElement('canvas')
+      canvas.width = AVATAR_SIZE
+      canvas.height = AVATAR_SIZE
+      canvas
+        .getContext('2d')
+        .drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, AVATAR_SIZE, AVATAR_SIZE)
+      canvas.toBlob(
+        (blob) => (blob ? resolve(blob) : reject(new Error("Couldn't process that image."))),
+        'image/jpeg',
+        0.88
+      )
+    }
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error("That file couldn't be read as an image."))
+    }
+    img.src = url
+  })
+}
+
+async function onAvatarPicked(event) {
+  const file = event.target.files?.[0]
+  event.target.value = '' // lets the same file be picked again
+  if (!file) return
+  clearNotice('avatar')
+
+  if (!file.type.startsWith('image/')) {
+    setNotice('avatar', 'error', 'Please choose an image file (JPG, PNG or WebP).')
+    return
+  }
+  if (file.size > AVATAR_MAX_BYTES) {
+    setNotice('avatar', 'error', 'That image is over 5 MB. Please choose a smaller one.')
+    return
+  }
+
+  uploadingAvatar.value = true
+  try {
+    const blob = await resizeToSquare(file)
+    const path = `${user.value.id}/avatar-${Date.now()}.jpg`
+
+    const { error: uploadError } = await supabase.storage
+      .from(AVATAR_BUCKET)
+      .upload(path, blob, { contentType: 'image/jpeg', cacheControl: '3600' })
+    if (uploadError) throw uploadError
+
+    const { data } = supabase.storage.from(AVATAR_BUCKET).getPublicUrl(path)
+    const previousPath = ownedAvatarPath(avatarUrl.value)
+
+    const { error: metaError } = await supabase.auth.updateUser({ data: { avatar_url: data.publicUrl } })
+    if (metaError) {
+      await supabase.storage.from(AVATAR_BUCKET).remove([path])
+      throw metaError
+    }
+
+    avatarOverride.value = data.publicUrl
+    if (previousPath) supabase.storage.from(AVATAR_BUCKET).remove([previousPath]) // best-effort cleanup
+    setNotice('avatar', 'success', 'Profile picture updated.')
+  } catch (err) {
+    setNotice('avatar', 'error', err.message || "Couldn't update your picture. Please try again.")
+  } finally {
+    uploadingAvatar.value = false
+  }
+}
+
+async function removeAvatar() {
+  const previousPath = ownedAvatarPath(avatarUrl.value)
+  if (!previousPath) return
+  clearNotice('avatar')
+
+  uploadingAvatar.value = true
+  try {
+    const { error } = await supabase.auth.updateUser({ data: { avatar_url: null } })
+    if (error) throw error
+
+    // Google users fall back to their Google photo; everyone else goes back to initials.
+    avatarOverride.value = meta.value.picture || ''
+    supabase.storage.from(AVATAR_BUCKET).remove([previousPath])
+    setNotice('avatar', 'success', 'Profile picture removed.')
+  } catch (err) {
+    setNotice('avatar', 'error', err.message || "Couldn't remove your picture. Please try again.")
+  } finally {
+    uploadingAvatar.value = false
+  }
+}
 
 const providers = computed(() => {
   const list = user.value?.app_metadata?.providers
@@ -358,6 +481,47 @@ function exportPosts(format) {
 }
 
 // ---------------------------------------------------------------------------
+// Reminders for scheduled posts
+// ---------------------------------------------------------------------------
+const remindersOn = computed(() => reminderSettings.enabled && permission.value === 'granted')
+const remindersBlocked = computed(() => permission.value === 'denied')
+
+const upcomingPosts = computed(() => {
+  const now = Date.now()
+  return posts.value
+    .filter((post) => post.status === 'scheduled' && post.scheduledFor && new Date(post.scheduledFor).getTime() >= now)
+    .sort((a, b) => new Date(a.scheduledFor) - new Date(b.scheduledFor))
+    .slice(0, 3)
+})
+
+async function toggleReminders() {
+  clearNotice('reminders')
+
+  if (remindersOn.value) {
+    disableReminders()
+    setNotice('reminders', 'success', 'Reminders turned off.')
+    return
+  }
+
+  const result = await enableReminders()
+  if (result === 'granted') {
+    setNotice('reminders', 'success', 'Reminders are on.')
+  } else if (result === 'denied') {
+    setNotice('reminders', 'error', 'Notifications are blocked for this site. Allow them in your browser settings, then try again.')
+  } else if (result === 'unsupported') {
+    setNotice('reminders', 'error', "This browser doesn't support notifications.")
+  } else {
+    setNotice('reminders', 'error', 'Allow notifications when your browser asks, then try again.')
+  }
+}
+
+async function testReminder() {
+  clearNotice('reminders')
+  const ok = await sendTest()
+  if (!ok) setNotice('reminders', 'error', "Couldn't show a notification. Check your browser's notification settings.")
+}
+
+// ---------------------------------------------------------------------------
 // Log out + unsaved-changes guard
 // ---------------------------------------------------------------------------
 const loggingOut = ref(false)
@@ -393,24 +557,66 @@ onBeforeRouteLeave(() => {
         <div class="h-20 bg-button-gradient" />
 
         <div class="px-4 pb-5 -mt-10 flex flex-col items-center text-center">
-          <div
-            class="w-20 h-20 rounded-full ring-4 ring-white shadow-lg overflow-hidden flex items-center justify-center bg-brand-navy text-white font-heading font-bold text-2xl select-none"
-          >
-            <img
-              v-if="showAvatar"
-              :src="avatarUrl"
-              alt=""
-              referrerpolicy="no-referrer"
-              class="w-full h-full object-cover"
-              @error="avatarFailed = true"
+          <div class="relative">
+            <div
+              class="w-20 h-20 rounded-full ring-4 ring-white shadow-lg overflow-hidden flex items-center justify-center bg-brand-navy text-white font-heading font-bold text-2xl select-none"
+            >
+              <img
+                v-if="showAvatar"
+                :src="avatarUrl"
+                alt=""
+                referrerpolicy="no-referrer"
+                class="w-full h-full object-cover"
+                @error="avatarFailed = true"
+              />
+              <span v-else>{{ initials }}</span>
+
+              <div v-if="uploadingAvatar" class="absolute inset-0 flex items-center justify-center rounded-full bg-brand-navy/60">
+                <span class="w-5 h-5 rounded-full border-2 border-white/40 border-t-white animate-spin" />
+              </div>
+            </div>
+
+            <button
+              type="button"
+              :disabled="uploadingAvatar"
+              aria-label="Change profile picture"
+              class="absolute -bottom-0.5 -right-0.5 w-8 h-8 flex items-center justify-center rounded-full bg-white text-brand-navy shadow-md ring-2 ring-white transition hover:bg-gray-50 active:scale-95 disabled:opacity-60 disabled:pointer-events-none focus-visible:outline-none focus-visible:ring-brand-indigo/40"
+              @click="avatarInput.click()"
+            >
+              <Camera :size="15" />
+            </button>
+            <input
+              ref="avatarInput"
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              class="sr-only"
+              tabindex="-1"
+              @change="onAvatarPicked"
             />
-            <span v-else>{{ initials }}</span>
           </div>
 
           <h2 class="font-heading font-bold text-brand-navy text-lg mt-3 break-words max-w-full">
             {{ displayName }}
           </h2>
           <p class="font-body text-sm text-brand-navy/60 break-all">{{ email }}</p>
+
+          <button
+            v-if="hasCustomAvatar"
+            type="button"
+            :disabled="uploadingAvatar"
+            class="mt-2 font-body text-xs font-semibold text-brand-indigo hover:underline underline-offset-2 disabled:opacity-60 disabled:pointer-events-none"
+            @click="removeAvatar"
+          >
+            Remove photo
+          </button>
+
+          <p
+            v-if="notices.avatar"
+            :role="notices.avatar.type === 'error' ? 'alert' : 'status'"
+            :class="[noticeClass[notices.avatar.type], 'mt-3 max-w-full']"
+          >
+            {{ notices.avatar.text }}
+          </p>
 
           <div class="flex flex-wrap justify-center gap-1.5 mt-3">
             <span v-if="usesGoogle" :class="providerChipClass">
@@ -583,6 +789,94 @@ onBeforeRouteLeave(() => {
             {{ savingProfile ? 'Saving...' : 'Save Changes' }}
           </button>
         </form>
+      </section>
+
+      <!-- Reminders -->
+      <section :class="cardClass" :style="{ animationDelay: '150ms' }">
+        <div class="flex items-center gap-3 px-4 py-3.5 border-b border-gray-100">
+          <span class="w-8 h-8 shrink-0 flex items-center justify-center rounded-full bg-brand-navy/5 text-brand-navy">
+            <Bell :size="16" />
+          </span>
+          <h3 class="font-heading font-bold text-brand-navy text-sm flex-1">Reminders</h3>
+        </div>
+
+        <div class="p-4 space-y-4">
+          <div class="flex items-center justify-between gap-4">
+            <div class="min-w-0">
+              <p class="font-body text-sm font-semibold text-brand-navy">Remind me about scheduled posts</p>
+              <p class="font-body text-xs text-brand-navy/50 mt-0.5">
+                You'll get a notification while Post Planner is open in your browser.
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              :aria-checked="remindersOn"
+              aria-label="Remind me about scheduled posts"
+              :disabled="!supported"
+              class="relative shrink-0 w-11 h-6 rounded-full transition-colors duration-200 disabled:opacity-50 disabled:pointer-events-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-indigo/40"
+              :class="remindersOn ? 'bg-brand-indigo' : 'bg-gray-300'"
+              @click="toggleReminders"
+            >
+              <span
+                class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200"
+                :class="remindersOn ? 'translate-x-5' : 'translate-x-0'"
+              />
+            </button>
+          </div>
+
+          <div>
+            <label for="account-reminder-lead" :class="labelClass">Remind me</label>
+            <select
+              id="account-reminder-lead"
+              :value="reminderSettings.leadMinutes"
+              :disabled="!remindersOn"
+              :class="inputClass"
+              @change="setLead($event.target.value)"
+            >
+              <option v-for="option in LEAD_OPTIONS" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+          </div>
+
+          <p v-if="remindersBlocked" class="font-body text-xs text-rose-600">
+            Notifications are blocked for this site. Allow them in your browser settings to use reminders.
+          </p>
+          <p v-else-if="!supported" class="font-body text-xs text-brand-navy/60">
+            This browser doesn't support notifications.
+          </p>
+
+          <div v-if="remindersOn">
+            <p :class="labelClass">Up next</p>
+            <ul v-if="upcomingPosts.length" class="space-y-2">
+              <li
+                v-for="post in upcomingPosts"
+                :key="post.id"
+                class="flex items-center justify-between gap-3 rounded-xl bg-amber-50 px-3 py-2"
+              >
+                <span class="font-body text-sm font-semibold text-amber-800 truncate">
+                  {{ post.title || 'Untitled post' }}
+                </span>
+                <span class="font-body text-xs text-amber-700 shrink-0">{{ formatDateTime(post.scheduledFor) }}</span>
+              </li>
+            </ul>
+            <p v-else class="font-body text-sm text-brand-navy/50">No upcoming scheduled posts.</p>
+          </div>
+
+          <p
+            v-if="notices.reminders"
+            :role="notices.reminders.type === 'error' ? 'alert' : 'status'"
+            :class="noticeClass[notices.reminders.type]"
+          >
+            {{ notices.reminders.text }}
+          </p>
+
+          <button v-if="remindersOn" type="button" :class="outlineButtonClass" @click="testReminder">
+            <Bell :size="16" />
+            Send a test notification
+          </button>
+        </div>
       </section>
 
       <!-- Password -->

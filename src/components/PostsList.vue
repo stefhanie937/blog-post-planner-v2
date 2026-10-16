@@ -6,7 +6,6 @@ import {
   SlidersHorizontal,
   PenSquare,
   MoreVertical,
-  Trash2,
   Pencil,
   Copy,
   RefreshCw,
@@ -26,7 +25,7 @@ const props = defineProps({
 })
 
 const router = useRouter()
-const { posts, loading, refreshing, fetchPosts, updatePostStatus, removePost } = usePosts()
+const { posts, loading, refreshing, fetchPosts, updatePostStatus } = usePosts()
 
 // ---------------------------------------------------------------------------
 // Status metadata
@@ -49,7 +48,8 @@ const STATUS_ACTIONS = {
   ],
   scheduled: [
     { label: 'Mark Published', status: 'published' },
-    { label: 'Move to Draft', status: 'draft' }
+    { label: 'Move to Draft', status: 'draft' },
+    { label: 'Archive', status: 'archived' }
   ],
   published: [{ label: 'Archive', status: 'archived' }],
   archived: [{ label: 'Restore to Draft', status: 'draft' }],
@@ -195,14 +195,13 @@ async function changeStatus(post, status) {
     showToast("Couldn't update that post. Please try again.")
     return
   }
-  showToast(`Moved to ${STATUS_META[status].label}`, () => updatePostStatus(post.id, previous))
+  const message = status === 'archived' ? 'Post archived' : `Moved to ${STATUS_META[status].label}`
+  showToast(message, () => undoStatus(post.id, previous))
 }
 
-async function deletePost(post) {
-  openMenuId.value = null
-  if (!window.confirm(`Delete "${post.title}"? This cannot be undone.`)) return
-  const ok = await removePost(post.id)
-  showToast(ok ? 'Post deleted' : "Couldn't delete that post. Please try again.")
+async function undoStatus(id, previous) {
+  const ok = await updatePostStatus(id, previous)
+  showToast(ok ? 'Change undone' : "Couldn't undo that change. Please try again.")
 }
 
 async function copyPost(post) {
@@ -599,14 +598,6 @@ function formatDate(iso) {
                 >
                   <Copy :size="14" />
                   Copy post text
-                </button>
-                <button
-                  type="button"
-                  class="w-full flex items-center gap-2 px-3 py-2 text-left font-body text-sm text-rose-600 transition-colors hover:bg-rose-50"
-                  @click="deletePost(post)"
-                >
-                  <Trash2 :size="14" />
-                  Delete
                 </button>
               </div>
             </div>
