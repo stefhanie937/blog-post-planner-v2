@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
+    "jspdf": "^4.2.1",
+    "jspdf-autotable": "^5.0.9",
     "lucide-vue-next": "^1.0.0",
     "vue": "^3.4.38",
     "vue-router": "^4.4.3"
