@@ -5,6 +5,7 @@ import { Mail, Lock } from 'lucide-vue-next'
 import { useAuth } from '../../composables/useAuth'
 import AuthShell from '../../layouts/AuthShell.vue'
 import AuthInput from '../../components/AuthInput.vue'
+import { supabase } from '../../lib/supabaseClient'
 
 const router = useRouter()
 const { signIn, signInWithGoogle } = useAuth()
@@ -19,8 +20,17 @@ async function handleSubmit() {
   errorMessage.value = ''
   loading.value = true
   try {
-    await signIn({ email: email.value, password: password.value })
-    router.push('/dashboard')
+    await signIn({ email: email.value.trim(), password: password.value })
+
+    const { data: { user } } = await supabase.auth.getUser()
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', user.id)
+      .single()
+
+    const isAdmin = profile?.is_admin === true || profile?.role === 'admin'
+    router.push(isAdmin ? { name: 'admin-dashboard' } : '/dashboard')
   } catch (err) {
     errorMessage.value = err.message || 'Unable to log in. Please try again.'
   } finally {

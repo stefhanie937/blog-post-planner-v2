@@ -36,13 +36,13 @@ const routes = [
     component: () => import('../views/Composer.vue'),
     meta: { requiresAuth: true }
   },
-    {
+  {
     path: '/composer/:id',
     name: 'composer-edit',
     component: () => import('../views/Composer.vue'),
     meta: { requiresAuth: true }
   },
-    {
+  {
     path: '/account',
     name: 'account',
     component: () => import('../views/Account.vue'),
@@ -71,8 +71,43 @@ const routes = [
     name: 'failed',
     component: () => import('../views/FailedPosts.vue'),
     meta: { requiresAuth: true }
+  },
+
+  // ---------------------------------------------------------------------
+  // Admin side
+  // ---------------------------------------------------------------------
+  {
+    path: '/admin/login',
+    name: 'admin-login',
+    component: () => import('../views/admin/AdminLogin.vue'),
+    meta: { adminGuestOnly: true }
+  },
+  {
+    path: '/admin',
+    redirect: { name: 'admin-dashboard' }
+  },
+  {
+    path: '/admin/dashboard',
+    name: 'admin-dashboard',
+    component: () => import('../views/admin/AdminDashboard.vue'),
+    meta: { requiresAdmin: true }
+  },
+  {
+    path: '/admin/users',
+    name: 'admin-users',
+    component: () => import('../views/admin/AdminUsers.vue'),
+    meta: { requiresAdmin: true }
+  },
+  {
+    path: '/admin/reports',
+    name: 'admin-reports',
+    component: () => import('../views/admin/AdminReports.vue'),
+    meta: { requiresAdmin: true }
+  },
+  {
+    path: '/admin/:pathMatch(.*)*',
+    redirect: { name: 'admin-dashboard' }
   }
-  // Account page still pending
 ]
 
 const router = createRouter({
@@ -81,17 +116,48 @@ const router = createRouter({
 })
 
 router.beforeEach(async (to) => {
-  const { user, sessionLoaded, initAuth } = useAuth()
+  const { user, profile, sessionLoaded, initAuth, loadProfile, signOut } = useAuth()
 
   if (!sessionLoaded.value) {
     await initAuth()
   }
 
-  if (to.meta.requiresAuth && !user.value) {
+  const meta = to.meta
+  const needsProfile =
+    meta.requiresAuth || meta.requiresAdmin || meta.guestOnly || meta.adminGuestOnly
+
+  if (user.value && needsProfile) {
+    await loadProfile()
+
+    // Deactivated accounts are signed out wherever they try to go.
+    if (profile.value?.is_active === false) {
+      try {
+        await signOut()
+      } catch {
+        // If sign-out fails the guard simply runs again on the next navigation.
+      }
+      const target = meta.requiresAdmin || meta.adminGuestOnly ? 'admin-login' : 'login'
+      if (to.name === target) return true
+      return { name: target, query: { deactivated: '1' } }
+    }
+  }
+
+  // Admin area
+  if (meta.requiresAdmin) {
+    if (!user.value) return { name: 'admin-login' }
+    if (profile.value?.role !== 'admin') return { name: 'dashboard' }
+  }
+
+  if (meta.adminGuestOnly && user.value && profile.value?.role === 'admin') {
+    return { name: 'admin-dashboard' }
+  }
+
+  // User area (unchanged behaviour)
+  if (meta.requiresAuth && !user.value) {
     return { name: 'login' }
   }
 
-  if (to.meta.guestOnly && user.value) {
+  if (meta.guestOnly && user.value) {
     return { name: 'dashboard' }
   }
 
